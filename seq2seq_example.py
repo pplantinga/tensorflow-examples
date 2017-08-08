@@ -27,6 +27,7 @@ class seq2seq_example:
     layers = 2
     layer_size = 100
     batch_size = 50
+    beam_width = 4
 
     def __init__(self):
 
@@ -86,8 +87,20 @@ class seq2seq_example:
     def cell(self):
         return rnn.MultiRNNCell([self.single_layer_cell() for _ in range(self.layers)])
 
+    def decoder_cell(self, inputs, lengths):
+        attention_mechanism = seq2seq.LuongAttention(
+                num_units              = self.layer_size,
+                memory                 = inputs,
+                memory_sequence_length = lengths,
+                scale                  = True)
+
+        return seq2seq.AttentionWrapper(
+                cell                 = self.cell(),
+                attention_mechanism  = attention_mechanism,
+                attention_layer_size = self.layer_size)
+
     def build_graph(self):
-        _, enc_state = tf.nn.dynamic_rnn(
+        enc_outputs, enc_state = tf.nn.dynamic_rnn(
                 cell            = self.cell(),
                 inputs          = self.enc_input,
                 sequence_length = self.lengths,
@@ -101,6 +114,11 @@ class seq2seq_example:
         
         # Training decoder: scheduled sampling et al.
         with tf.variable_scope("decode"):
+            
+            cell = self.decoder_cell(enc_outputs, self.lengths)
+            init_state = cell.zero_state(self.batch_size, tf.float32)
+            init_state = init_state.clone(cell_state=dec_start_state)
+            
             train_helper = seq2seq.ScheduledEmbeddingTrainingHelper(
                     inputs               = self.dec_input,
                     sequence_length      = self.lengths,
@@ -108,26 +126,31 @@ class seq2seq_example:
                     sampling_probability = 0.1)
 
             train_decoder = seq2seq.BasicDecoder(
-                    cell          = self.cell(),
+                    cell          = cell,
                     helper        = train_helper,
-                    initial_state = dec_start_state,
+                    initial_state = init_state,
                     output_layer  = output)
             
             train_output, _, train_lengths = seq2seq.dynamic_decode(
                     decoder            = train_decoder,
                     maximum_iterations = self.maxLength)
 
-        beam_size = 4
-        tiled = seq2seq.tile_batch(dec_start_state, beam_size)
+        dec_start_state = seq2seq.tile_batch(dec_start_state, self.beam_width)
+        enc_outputs = seq2seq.tile_batch(enc_outputs, self.beam_width)
+        lengths = seq2seq.tile_batch(self.lengths, self.beam_width)
 
         with tf.variable_scope("decode", reuse=True):
+            cell = self.decoder_cell(enc_outputs, lengths)
+            init_state = cell.zero_state(self.batch_size * self.beam_width, tf.float32)
+            init_state = init_state.clone(cell_state=dec_start_state)
+            
             test_decoder = seq2seq.BeamSearchDecoder(
-                    cell          = self.cell(),
+                    cell          = cell,
                     embedding     = self.dec_embed,
-                    start_tokens  = tf.ones_like(self.lengths) * self.tokens['GO'],
+                    start_tokens  = tf.ones(self.batch_size, dtype=tf.int32) * self.tokens['GO'],
                     end_token     = self.tokens['EOS'],
-                    initial_state = tiled,
-                    beam_width    = beam_size,
+                    initial_state = init_state,
+                    beam_width    = self.beam_width,
                     output_layer  = output)
             test_output, _, test_lengths = seq2seq.dynamic_decode(
                     decoder            = test_decoder,
